@@ -1,0 +1,203 @@
+name: Upstream Sync & Digest
+
+# Log-driven upstream digest. No rebase, no tags, no merge-base.
+#
+# This fork exists only to host this workflow. Our `main` holds the workflow,
+# the digest script, and upstream-sync.log — the single tracked file that is
+# both the "last synced upstream tip" marker and an append-only history.
+#
+# upstream/main is read-only here: we fetch it by ref and compute the delta
+# between the SHA recorded at the top of upstream-sync.log and the current
+# upstream tip. After posting the digest comment, we prepend a new line to the
+# log and commit it to main. That commit is the ONLY write the workflow makes.
+#
+# Resumability: the log line is written only after the digest comment lands, so
+# a run that fails late redoes the same range next time.
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+# Serialize runs so two concurrent runs (schedule + manual) can't both commit
+# to main and lose an update to upstream-sync.log.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: earendil-works/pi-mono
+  UPSTREAM_BRANCH: main
+  LOG_FILE: upstream-sync.log
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # No --tags: we never want upstream's tags, and tag refs pointing at
+          # upstream commits would trip GitHub's workflow-protection on push.
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - name: Resolve range
+        id: range
+        run: |
+          UPSTREAM=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+
+          # Last synced tip = first non-comment, non-empty line of the log.
+          # Columns: <ISO date> <upstream-sha> <short-sha> <count> <comment-url>
+          LAST=""
+          if [ -f "${LOG_FILE}" ]; then
+            LAST=$(grep -m1 -vE '^\s*(#|$)' "${LOG_FILE}" | awk '{print $2}')
+          fi
+
+          # Validate it's a 40-char hex SHA; ignore garbage if not.
+          if ! printf '%s' "$LAST" | grep -qE '^[0-9a-f]{40}$'; then
+            LAST=""
+          fi
+
+          echo "upstream=${UPSTREAM}" >> "$GITHUB_OUTPUT"
+          echo "last=${LAST}" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$LAST" ]; then
+            # Bootstrap: never synced before. Initialize the marker to the
+            # current tip without producing a catch-up digest; daily cadence
+            # starts naturally from here tomorrow.
+            echo "bootstrapping=true" >> "$GITHUB_OUTPUT"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "First run: initializing ${LOG_FILE} at ${UPSTREAM}, no digest this run."
+          elif [ "$LAST" = "$UPSTREAM" ]; then
+            echo "bootstrapping=false" >> "$GITHUB_OUTPUT"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No new upstream commits since ${LAST}."
+          else
+            echo "bootstrapping=false" >> "$GITHUB_OUTPUT"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "$(git rev-list "${LAST}..${UPSTREAM}" --count) new upstream commits."
+          fi
+
+      - name: Generate digest prompt
+        if: steps.range.outputs.has_changes == 'true' && steps.range.outputs.bootstrapping == 'false'
+        id: prompt
+        run: |
+          # Pass resolved SHAs so the script never has to resolve a ref that
+          # might be missing or echoed literally by git.
+          {
+            echo 'content<<PROMPT_EOF'
+            bun scripts/upstream-digest.ts \
+              --from "${{ steps.range.outputs.last }}" \
+              --to "${{ steps.range.outputs.upstream }}"
+            echo ""
+            echo 'PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Remove fork Pi configuration to avoid loading local config
+        if: steps.range.outputs.has_changes == 'true' && steps.range.outputs.bootstrapping == 'false'
+        run: rm -rf .pi
+
+      - name: Generate LLM digest
+        if: steps.range.outputs.has_changes == 'true' && steps.range.outputs.bootstrapping == 'false'
+        id: pi
+        uses: shaftoe/pi-coding-agent-action@v2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          provider: ${{ vars.PROVIDER }}
+          model: ${{ vars.MODEL }}
+          token: ${{ secrets.LLM_API_KEY }}
+          thinking_level: ${{ vars.THINKING_LEVEL }}
+          prompt: ${{ steps.prompt.outputs.content }}
+
+      - name: Post digest comment and capture URL
+        if: steps.range.outputs.has_changes == 'true' && steps.range.outputs.bootstrapping == 'false' && steps.pi.outputs.success == 'true'
+        id: comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.pi.outputs.response }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          {
+            echo "## Digest — ${DATE}"
+            echo ""
+            echo "${DIGEST}"
+          } > /tmp/digest-comment.md
+          # gh prints the created comment URL to stdout on success; use it verbatim.
+          URL=$(gh issue comment "${{ vars.ISSUE_TRACKER_NUMBER }}" --repo "${{ github.repository }}" --body-file /tmp/digest-comment.md)
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Post bootstrap notice
+        if: steps.range.outputs.bootstrapping == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ vars.ISSUE_TRACKER_NUMBER }}" --repo "${{ github.repository }}" --body "## Upstream digest tracking initialized
+
+          No prior entry in \`${LOG_FILE}\`. This run initialized it at the current upstream tip and produced no digest.
+
+          Daily digests start on the next scheduled run.
+
+          - Initialized at: \`${{ steps.range.outputs.upstream }}\`"
+
+      # Commit the new log line ONLY after the comment has been posted. This is
+      # the resumability boundary: a failure here means next run redoes the
+      # same range. Order matters — comment first, then log commit.
+      - name: Record synced upstream tip
+        if: steps.range.outputs.has_changes == 'true'
+        run: |
+          UPSTREAM="${{ steps.range.outputs.upstream }}"
+          SHORT=$(git rev-parse --short=12 "${UPSTREAM}")
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          if [ "${{ steps.range.outputs.bootstrapping }}" = "true" ]; then
+            COUNT=0
+            COMMENT_URL="(bootstrap)"
+          else
+            COUNT=$(git rev-list "${{ steps.range.outputs.last }}..${UPSTREAM}" --count)
+            COMMENT_URL="${{ steps.comment.outputs.url }}"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Prepend header on first creation so the file is self-documenting.
+          if [ ! -f "${LOG_FILE}" ]; then
+            printf '# upstream-sync log. Newest first.\n# Columns: <ISO date> <upstream-sha> <short-sha> <commit-count> <comment-url>\n' > "${LOG_FILE}"
+          fi
+
+          # Prepend the new line (newest at top).
+          tmp=$(mktemp)
+          printf '%s\t%s\t%s\t%s\t%s\n' "${NOW}" "${UPSTREAM}" "${SHORT}" "${COUNT}" "${COMMENT_URL}" > "${tmp}"
+          cat "${LOG_FILE}" >> "${tmp}"
+          mv "${tmp}" "${LOG_FILE}"
+
+          git add "${LOG_FILE}"
+          git commit -m "chore: record upstream sync ${SHORT} (upstream tip ${UPSTREAM}, ${COUNT} commits)"
+
+          # main is single-writer (this bot, serialized by the concurrency
+          # group), so a plain push should succeed. Rebase-retry guards against
+          # the rare case where a manual edit landed between fetch and push.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:${UPSTREAM_BRANCH}; then
+              exit 0
+            fi
+            echo "push rejected (attempt ${attempt}), rebasing on origin/${UPSTREAM_BRANCH}..."
+            git fetch origin "${UPSTREAM_BRANCH}"
+            git rebase "origin/${UPSTREAM_BRANCH}"
+          done
+          echo "Error: failed to push after 3 attempts" >&2
+          exit 1
