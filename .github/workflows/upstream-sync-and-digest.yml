@@ -1,0 +1,111 @@
+name: Upstream Sync & Digest
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: earendil-works/pi-mono
+  UPSTREAM_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          MERGE_BASE=$(git merge-base HEAD "upstream/${UPSTREAM_BRANCH}")
+          UPSTREAM=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+
+          if [ "$MERGE_BASE" = "$UPSTREAM" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No new upstream commits."
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "merge_base=${MERGE_BASE}" >> "$GITHUB_OUTPUT"
+            echo "$(git rev-list "${MERGE_BASE}..${UPSTREAM}" --count) new upstream commits."
+          fi
+
+      - name: Rebase onto upstream and push
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git rebase "upstream/${UPSTREAM_BRANCH}"
+          git push --force origin "${UPSTREAM_BRANCH}"
+
+      - name: Generate digest prompt
+        if: steps.check.outputs.has_changes == 'true'
+        id: prompt
+        run: |
+          {
+            echo 'content<<PROMPT_EOF'
+            bun scripts/upstream-digest.ts --from "${{ steps.check.outputs.merge_base }}" --to "upstream/${UPSTREAM_BRANCH}"
+            echo ""
+            echo 'PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Remove fork Pi configuration to avoid loading local config
+        if: steps.check.outputs.has_changes == 'true'
+        run: rm -rf .pi
+
+      - name: Generate LLM digest
+        if: steps.check.outputs.has_changes == 'true'
+        id: pi
+        uses: shaftoe/pi-coding-agent-action@v2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          provider: ${{ vars.PROVIDER }}
+          model: ${{ vars.MODEL }}
+          token: ${{ secrets.LLM_API_KEY }}
+          thinking_level: ${{ vars.THINKING_LEVEL }}
+          prompt: ${{ steps.prompt.outputs.content }}
+
+      - name: Post digest comment
+        if: steps.pi.outputs.success == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.pi.outputs.response }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          {
+            echo "## Digest — ${DATE}"
+            echo ""
+            echo "${DIGEST}"
+          } > /tmp/digest-comment.md
+          gh issue comment "${{ vars.ISSUE_TRACKER_NUMBER }}" --repo "${{ github.repository }}" --body-file /tmp/digest-comment.md
+
+      - name: Notify rebase conflict
+        if: failure() && steps.check.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment "${{ vars.ISSUE_TRACKER_NUMBER }}" --repo "${{ github.repository }}" --body "**Upstream sync conflict — manual resolution required**
+
+          The daily upstream sync failed: rebase onto \`${UPSTREAM_REPO}/${UPSTREAM_BRANCH}\` produced conflicts.
+
+          **Time:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          Resolve the conflict manually, then close this issue. The next scheduled sync will proceed normally."
